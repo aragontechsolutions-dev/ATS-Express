@@ -1,0 +1,633 @@
+// =============================================================================
+// ATS-Express — Sistema de Delivery Híbrido
+// Schema Prisma (Etapa 0 — Modelo de datos)
+//
+// Stack: NestJS (monolito modular) + Prisma v5 + Supabase (Postgres + RLS)
+// Multi-tenancy "bridge model": una sola base, diferenciación por datos
+//   (operationMode + businessId). Aislamiento primario en NestJS,
+//   RLS como defensa en profundidad (policies se agregan luego en Etapa 0).
+//
+// Convenciones:
+//   - IDs UUID (compatibles con Supabase auth.uid()).
+//   - Profile.id == auth.users.id de Supabase (no se autogenera).
+//   - Entidades "tenant-owned" llevan businessId para scoping/RLS.
+//   - Los pedidos guardan SNAPSHOTS (nombre/precio) para integridad histórica.
+//
+// NOTA: este archivo es para revisión. Aún no se generó cliente ni migración.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // URL con connection pooling (Supabase pgBouncer) para runtime
+  url       = env("DATABASE_URL")
+  // Conexión directa para migraciones (Prisma Migrate)
+  directUrl = env("DIRECT_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+/// Modo de despacho del negocio. Definido desde el MVP (cambiarlo luego
+/// implica migración compleja). HYBRID queda previsto pero no operativo en MVP.
+enum OperationMode {
+  OWN_FLEET // riders propios; dispatch busca solo entre ellos
+  MARKETPLACE_FLEET // sin flota propia; usa el pool de riders de ATS
+  HYBRID // riders propios + fallback al pool de ATS (no operativo en MVP)
+}
+
+/// Un único rol por usuario (decisión MVP).
+enum UserRole {
+  CUSTOMER // cliente final
+  BUSINESS_OWNER // dueño de negocio
+  BUSINESS_STAFF // staff del negocio (recepción de pedidos, menú)
+  RIDER // repartidor (propio del negocio o del pool ATS)
+  ATS_ADMIN // admin de la empresa de delivery (ATS)
+  SUPER_ADMIN // super-admin de plataforma
+}
+
+/// Estados del ciclo de vida del pedido.
+enum OrderStatus {
+  PENDING_PAYMENT // esperando confirmación de pago (MercadoPago)
+  ACCEPTED // aceptado por el negocio / pago confirmado o efectivo
+  IN_PREPARATION // el negocio está preparando
+  READY_FOR_PICKUP // listo para que lo retire el rider
+  AT_RESTAURANT // rider llegó a buscar el pedido
+  PICKED_UP // rider retiró el pedido
+  ON_THE_WAY // en trayecto (tracking en vivo)
+  DELIVERED // entregado
+  CANCELLED // cancelado (ver cancelReason)
+}
+
+/// Tipo de cumplimiento del pedido.
+enum FulfillmentType {
+  DELIVERY // a domicilio (con rider)
+  PICKUP // retiro en el local por el cliente
+}
+
+/// Métodos de pago soportados en el MVP.
+enum PaymentMethod {
+  MERCADOPAGO // Checkout API (cubre Visa/MC, PREX, MiDinero, AlfaBROU, bancos UY)
+  CASH // efectivo / contraentrega
+}
+
+enum PaymentStatus {
+  PENDING // creado, esperando resultado
+  AUTHORIZED // autorizado (pendiente de captura, si aplica)
+  PAID // pagado/aprobado
+  FAILED // rechazado
+  REFUNDED // reembolsado
+  CANCELLED // cancelado antes de cobrar
+}
+
+/// Estado de disponibilidad del rider.
+enum RiderStatus {
+  OFFLINE // no disponible
+  AVAILABLE // disponible para asignación
+  BUSY // con un pedido asignado en curso
+}
+
+/// Estado de la asignación de despacho (Delivery).
+enum DeliveryStatus {
+  PENDING_ASSIGNMENT // pedido listo para asignar, sin rider aún
+  ASSIGNED // rider asignado (manual en el MVP)
+  ACCEPTED_BY_RIDER // el rider aceptó la asignación
+  AT_RESTAURANT // rider en el local
+  PICKED_UP // pedido retirado
+  ON_THE_WAY // en trayecto
+  DELIVERED // entregado
+  CANCELLED // asignación cancelada / reasignada
+}
+
+/// Estado de la suscripción mensual del negocio (cobro a negocios).
+enum SubscriptionStatus {
+  TRIAL // período de prueba
+  ACTIVE // al día
+  PAST_DUE // pago vencido
+  CANCELLED // dada de baja
+}
+
+/// Cómo se gestiona el cobro de la suscripción.
+enum SubscriptionProvider {
+  MANUAL // factura/transferencia gestionada a mano (MVP)
+  MERCADOPAGO // suscripción recurrente vía MercadoPago (futuro)
+}
+
+// =============================================================================
+// CORE: Zonas, Usuarios, Negocios
+// =============================================================================
+
+/// Localidades de cobertura (Maldonado, UY). Relación, no enum suelto,
+/// para permitir reglas distintas por localidad a futuro.
+model Zone {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  businesses Business[]
+  riders     Rider[]
+  orders     Order[]
+
+  @@map("zones")
+}
+
+/// Perfil de usuario. id == auth.users.id de Supabase (no se autogenera).
+/// Un único rol por usuario (decisión MVP).
+model Profile {
+  id        String   @id @db.Uuid // = Supabase auth uid
+  role      UserRole
+  email     String   @unique
+  fullName  String?
+  phone     String?
+  avatarUrl String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Si es dueño/staff de un negocio (BUSINESS_OWNER / BUSINESS_STAFF)
+  businessId String?   @db.Uuid
+  business   Business? @relation("BusinessMembers", fields: [businessId], references: [id], onDelete: SetNull)
+
+  // Si es dueño principal de un negocio (1:1 inverso de Business.owner)
+  ownedBusiness Business? @relation("BusinessOwner")
+
+  // Si es RIDER, su ficha de repartidor
+  rider Rider? @relation("RiderProfile")
+
+  // Si es CUSTOMER
+  addresses CustomerAddress[]
+  orders    Order[]           @relation("CustomerOrders")
+  reviews   Review[]
+
+  @@index([businessId])
+  @@index([role])
+  @@map("profiles")
+}
+
+/// Negocio afiliado (tenant). Núcleo del multi-tenant.
+model Business {
+  id            String        @id @default(uuid()) @db.Uuid
+  name          String
+  slug          String        @unique // para URL pública de pedido
+  description   String?
+  logoUrl       String?
+  operationMode OperationMode @default(OWN_FLEET)
+  isActive      Boolean       @default(true)
+
+  // Datos de contacto / ubicación del local
+  phone     String?
+  email     String?
+  address   String?
+  latitude  Float?
+  longitude Float?
+
+  // Zona donde opera el local
+  zoneId String? @db.Uuid
+  zone   Zone?   @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+
+  // Dueño principal (1:1) y miembros (staff)
+  ownerId String?   @unique @db.Uuid
+  owner   Profile?  @relation("BusinessOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  members Profile[] @relation("BusinessMembers")
+
+  // Parámetros de delivery
+  deliveryFee   Decimal  @default(0) @db.Decimal(10, 2)
+  minOrderTotal Decimal  @default(0) @db.Decimal(10, 2)
+  prepTimeMins  Int      @default(20)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relaciones tenant-owned
+  hours         BusinessHour[]
+  categories    Category[]
+  products      Product[]
+  modifierGroups ModifierGroup[]
+  orders        Order[]
+  riders        Rider[] // riders propios (businessId no nulo)
+  subscription  Subscription?
+
+  @@index([zoneId])
+  @@index([operationMode])
+  @@map("businesses")
+}
+
+/// Horarios de atención del negocio (por día de semana).
+model BusinessHour {
+  id         String   @id @default(uuid()) @db.Uuid
+  businessId String   @db.Uuid
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  dayOfWeek Int // 0=domingo ... 6=sábado
+  openTime  String // "HH:mm" (24h)
+  closeTime String // "HH:mm" (24h)
+  isClosed  Boolean @default(false)
+
+  @@unique([businessId, dayOfWeek])
+  @@index([businessId])
+  @@map("business_hours")
+}
+
+/// Suscripción mensual del negocio (modelo de cobro a negocios: monto fijo,
+/// sin comisión por pedido). En el MVP el cobro puede ser MANUAL.
+model Subscription {
+  id         String   @id @default(uuid()) @db.Uuid
+  businessId String   @unique @db.Uuid
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  status      SubscriptionStatus   @default(TRIAL)
+  provider    SubscriptionProvider @default(MANUAL)
+  amount      Decimal              @db.Decimal(10, 2)
+  currency    String               @default("UYU")
+  periodStart DateTime?
+  periodEnd   DateTime?
+  externalId  String? // id de suscripción en MercadoPago (futuro)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("subscriptions")
+}
+
+// =============================================================================
+// CATALOG: Categorías, Productos, Variantes, Modificadores
+// =============================================================================
+
+model Category {
+  id         String   @id @default(uuid()) @db.Uuid
+  businessId String   @db.Uuid
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  name      String
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  products Product[]
+
+  @@index([businessId])
+  @@map("categories")
+}
+
+model Product {
+  id         String   @id @default(uuid()) @db.Uuid
+  businessId String   @db.Uuid
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  categoryId String?   @db.Uuid
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  name        String
+  description String?
+  imageUrl    String?
+  basePrice   Decimal @db.Decimal(10, 2)
+
+  // Control de stock simple (null = sin control de stock)
+  stock       Int?
+  isAvailable Boolean @default(true)
+  sortOrder   Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  variants       ProductVariant[]
+  modifierGroups ModifierGroup[]
+  orderItems     OrderItem[]
+
+  @@index([businessId])
+  @@index([categoryId])
+  @@map("products")
+}
+
+/// Variante vendible del producto con su propio precio/stock (ej. tamaños).
+model ProductVariant {
+  id        String  @id @default(uuid()) @db.Uuid
+  productId String  @db.Uuid
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  name        String // ej. "Grande", "Personal"
+  priceDelta  Decimal @default(0) @db.Decimal(10, 2) // suma/resta sobre basePrice
+  stock       Int?
+  isAvailable Boolean @default(true)
+  sortOrder   Int     @default(0)
+
+  orderItems OrderItem[]
+
+  @@index([productId])
+  @@map("product_variants")
+}
+
+/// Grupo de modificadores (ej. "Extras", "Punto de cocción").
+/// Pertenece a un producto (a futuro podría ser reusable por negocio).
+model ModifierGroup {
+  id         String   @id @default(uuid()) @db.Uuid
+  businessId String   @db.Uuid
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  productId String?  @db.Uuid
+  product   Product? @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  name      String
+  minSelect Int     @default(0) // mínimo de opciones a elegir
+  maxSelect Int     @default(1) // máximo (1 = selección única)
+  required  Boolean @default(false)
+  sortOrder Int     @default(0)
+
+  modifiers Modifier[]
+
+  @@index([businessId])
+  @@index([productId])
+  @@map("modifier_groups")
+}
+
+/// Opción individual dentro de un grupo de modificadores.
+model Modifier {
+  id      String        @id @default(uuid()) @db.Uuid
+  groupId String        @db.Uuid
+  group   ModifierGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  name        String
+  priceDelta  Decimal @default(0) @db.Decimal(10, 2)
+  isAvailable Boolean @default(true)
+  sortOrder   Int     @default(0)
+
+  orderItemModifiers OrderItemModifier[]
+
+  @@index([groupId])
+  @@map("modifiers")
+}
+
+// =============================================================================
+// CUSTOMER: Direcciones
+// =============================================================================
+
+model CustomerAddress {
+  id         String  @id @default(uuid()) @db.Uuid
+  customerId String  @db.Uuid
+  customer   Profile @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  label        String? // ej. "Casa", "Trabajo"
+  addressLine  String
+  reference    String? // referencias para el rider
+  latitude     Float?
+  longitude    Float?
+  isDefault    Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@map("customer_addresses")
+}
+
+// =============================================================================
+// ORDERS (OMS): Pedido, ítems, modificadores elegidos, historial, pago
+// =============================================================================
+
+model Order {
+  id     String @id @default(uuid()) @db.Uuid
+  // Código corto legible para humanos (ej. mostrar al cliente/rider)
+  code   String @unique
+
+  businessId String   @db.Uuid
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+
+  customerId String  @db.Uuid
+  customer   Profile @relation("CustomerOrders", fields: [customerId], references: [id], onDelete: Restrict)
+
+  zoneId String? @db.Uuid
+  zone   Zone?   @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+
+  status          OrderStatus     @default(PENDING_PAYMENT)
+  fulfillmentType FulfillmentType @default(DELIVERY)
+
+  // Snapshot de la dirección de entrega al momento del pedido
+  deliveryAddress   String?
+  deliveryReference String?
+  deliveryLatitude  Float?
+  deliveryLongitude Float?
+
+  // Montos (snapshot)
+  subtotal    Decimal @default(0) @db.Decimal(10, 2)
+  deliveryFee Decimal @default(0) @db.Decimal(10, 2)
+  total       Decimal @default(0) @db.Decimal(10, 2)
+  currency    String  @default("UYU")
+
+  notes        String?
+  cancelReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items         OrderItem[]
+  payment       Payment?
+  delivery      Delivery?
+  statusHistory OrderStatusHistory[]
+  review        Review?
+
+  @@index([businessId])
+  @@index([customerId])
+  @@index([status])
+  @@index([zoneId])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+/// Ítem del pedido. Guarda snapshots de nombre/precio para integridad histórica
+/// (si luego cambia el catálogo, el pedido conserva lo que se cobró).
+model OrderItem {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productId String?  @db.Uuid
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  variantId String?         @db.Uuid
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  // Snapshots
+  productName String
+  variantName String?
+  unitPrice   Decimal @db.Decimal(10, 2) // precio unitario final (base + variante)
+  quantity    Int     @default(1)
+  lineTotal   Decimal @db.Decimal(10, 2) // (unitPrice + modificadores) * quantity
+  notes       String?
+
+  modifiers OrderItemModifier[]
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+/// Modificador elegido en un ítem del pedido (snapshot).
+model OrderItemModifier {
+  id          String    @id @default(uuid()) @db.Uuid
+  orderItemId String    @db.Uuid
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  modifierId String?   @db.Uuid
+  modifier   Modifier? @relation(fields: [modifierId], references: [id], onDelete: SetNull)
+
+  // Snapshots
+  modifierName String
+  priceDelta   Decimal @db.Decimal(10, 2)
+
+  @@index([orderItemId])
+  @@map("order_item_modifiers")
+}
+
+/// Historial de transiciones de estado del pedido.
+/// Soporta auditoría y la SAGA de checkout del módulo Orders.
+model OrderStatusHistory {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  status    OrderStatus
+  note      String?
+  changedBy String?     @db.Uuid // Profile.id que originó el cambio (si aplica)
+  createdAt DateTime    @default(now())
+
+  @@index([orderId])
+  @@map("order_status_history")
+}
+
+// =============================================================================
+// PAYMENTS
+// =============================================================================
+
+model Payment {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @unique @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  method   PaymentMethod
+  status   PaymentStatus @default(PENDING)
+  amount   Decimal       @db.Decimal(10, 2)
+  currency String        @default("UYU")
+
+  // Datos de MercadoPago (si method == MERCADOPAGO)
+  mpPreferenceId String?
+  mpPaymentId    String?
+  mpStatusDetail String?
+
+  // Efectivo: confirmación de cobro al entregar
+  cashCollected   Boolean   @default(false)
+  cashCollectedAt DateTime?
+
+  paidAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([status])
+  @@map("payments")
+}
+
+// =============================================================================
+// RIDERS, DISPATCH (Delivery) y TRACKING
+// =============================================================================
+
+/// Repartidor. businessId nulo => pertenece al pool de ATS (marketplace).
+/// businessId no nulo => rider propio del negocio.
+model Rider {
+  id        String  @id @default(uuid()) @db.Uuid
+  profileId String  @unique @db.Uuid
+  profile   Profile @relation("RiderProfile", fields: [profileId], references: [id], onDelete: Cascade)
+
+  businessId String?   @db.Uuid // null = pool ATS
+  business   Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+
+  zoneId String? @db.Uuid
+  zone   Zone?   @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+
+  status      RiderStatus @default(OFFLINE)
+  vehicleType String? // ej. "moto", "bici", "auto"
+  isActive    Boolean     @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  location   RiderLocation?
+  deliveries Delivery[]
+
+  @@index([businessId])
+  @@index([zoneId])
+  @@index([status])
+  @@map("riders")
+}
+
+/// Ubicación actual del rider (1 fila por rider, upsert).
+/// Pensada para Supabase Realtime: el front se suscribe a cambios de esta fila.
+model RiderLocation {
+  riderId   String   @id @db.Uuid
+  rider     Rider    @relation(fields: [riderId], references: [id], onDelete: Cascade)
+  latitude  Float
+  longitude Float
+  heading   Float?
+  accuracy  Float?
+  updatedAt DateTime @updatedAt
+
+  @@map("rider_locations")
+}
+
+/// Asignación de despacho de un pedido a un rider (1:1 con Order).
+/// Manual en el MVP; la lógica de elegibilidad depende de operationMode.
+model Delivery {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @unique @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  riderId String? @db.Uuid
+  rider   Rider?  @relation(fields: [riderId], references: [id], onDelete: SetNull)
+
+  status DeliveryStatus @default(PENDING_ASSIGNMENT)
+
+  assignedBy   String?   @db.Uuid // Profile.id (negocio o admin ATS) que asignó
+  assignedAt   DateTime?
+  atRestaurantAt DateTime?
+  pickedUpAt   DateTime?
+  deliveredAt  DateTime?
+
+  // Prueba de entrega opcional
+  proofPhotoUrl String?
+
+  // Métricas opcionales (para reportes futuros)
+  distanceMeters Int?
+  etaMinutes     Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([riderId])
+  @@index([status])
+  @@map("deliveries")
+}
+
+// =============================================================================
+// REVIEWS (rating opcional al cierre)
+// =============================================================================
+
+model Review {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @unique @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  customerId String  @db.Uuid
+  customer   Profile @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  rating  Int // 1..5
+  comment String?
+
+  createdAt DateTime @default(now())
+
+  @@index([customerId])
+  @@map("reviews")
+}
