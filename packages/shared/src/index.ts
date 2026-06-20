@@ -89,8 +89,9 @@ export type SubscriptionProvider =
   (typeof SubscriptionProvider)[keyof typeof SubscriptionProvider];
 
 export const SubscriptionPlan = {
-  BASIC: 'BASIC',
+  FREE: 'FREE',
   PRO: 'PRO',
+  PREMIUM: 'PREMIUM',
 } as const;
 export type SubscriptionPlan =
   (typeof SubscriptionPlan)[keyof typeof SubscriptionPlan];

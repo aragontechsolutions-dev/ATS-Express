@@ -115,8 +115,9 @@ enum SubscriptionProvider {
 
 /// Plan/tier de la suscripción SaaS del local.
 enum SubscriptionPlan {
-  BASIC // funcionalidades núcleo
-  PRO // límites mayores / features avanzadas
+  FREE // Inicial: carta online + recepción de pedidos (reemplaza WhatsApp), tope bajo
+  PRO // + riders, tracking en vivo, estados, reportes
+  PREMIUM // + cobro online, WhatsApp automático, multi-sucursal
 }
 
 // =============================================================================
@@ -251,7 +252,7 @@ model Subscription {
   business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
 
   status      SubscriptionStatus   @default(TRIAL)
-  plan        SubscriptionPlan     @default(BASIC)
+  plan        SubscriptionPlan     @default(FREE)
   provider    SubscriptionProvider @default(MANUAL)
   amount      Decimal              @db.Decimal(10, 2)
   currency    String               @default("UYU")
