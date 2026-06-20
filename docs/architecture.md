@@ -1,8 +1,14 @@
-# Arquitectura — ATS-Express (Sistema de Delivery Híbrido)
+# Arquitectura — ATS-Express (Plataforma SaaS de pedidos y delivery)
 
 > **Etapa 0 — Documento de arquitectura.**
 > Monolito modular en NestJS, multi-tenancy "bridge model", Supabase (Postgres + RLS + Realtime).
 > Autor del proyecto: Osmel — Aragon Tech Solutions (ATS), Maldonado, Uruguay.
+
+> **Modelo de negocio:** SaaS white-label para locales que **ya tienen sus propios
+> repartidores**. ATS provee el software (menú online, gestión de pedidos, tracking
+> en vivo, app del rider); **no opera flota ni maneja los fondos del pedido**. El
+> cobro al cliente va **directo a la cuenta MercadoPago del local**; ATS factura
+> únicamente una **suscripción mensual** al local.
 
 ---
 
@@ -10,9 +16,9 @@
 
 Un único backend NestJS (monolito modular) expone una sola API que consumen
 **cuatro frontends**: web de pedido del cliente, app móvil del cliente, app del
-rider, y los paneles web (negocio + admin ATS). La diferenciación entre negocios
-con flota propia y el marketplace de ATS se hace **a nivel de datos**
-(`operationMode` + `businessId`), no de infraestructura separada.
+rider, y los paneles web (negocio + admin ATS). La separación entre locales se
+hace **a nivel de datos** (`businessId`), no de infraestructura separada. Cada
+local gestiona sus propios riders y conecta su propia cuenta de cobro.
 
 ```mermaid
 graph TB
@@ -37,7 +43,7 @@ graph TB
   end
 
   subgraph Externos["Servicios externos"]
-    MP["MercadoPago<br/>Checkout API"]
+    MP["MercadoPago<br/>(cuenta de cada local)"]
     Mapbox["Mapbox"]
     WA["WhatsApp API<br/>(reuso ATS)"]
     Cron["cron-job.org<br/>(keep-alive)"]
@@ -74,16 +80,16 @@ un servicio independiente si el proyecto escala, sin reescribir la lógica.
 ```mermaid
 graph TD
   Auth["Auth<br/><i>login/registro multi-rol</i>"]
-  Business["Business (Tenant)<br/><i>operationMode, zona, suscripción, horarios</i>"]
+  Business["Business (Tenant)<br/><i>zona, suscripción, horarios, cuenta MP</i>"]
   Catalog["Catalog<br/><i>menú, productos, variantes, modificadores</i>"]
   Orders["Orders (OMS)<br/><i>ciclo de vida + SAGA de checkout</i>"]
-  Dispatch["Dispatch<br/><i>asignación de rider según operationMode</i>"]
-  Riders["Riders<br/><i>propios (businessId) o pool ATS (null)</i>"]
+  Dispatch["Dispatch<br/><i>asignación de rider del local</i>"]
+  Riders["Riders<br/><i>repartidores del local</i>"]
   Tracking["Geolocation / Tracking<br/><i>ubicación en vivo, ETA</i>"]
-  Payments["Payments<br/><i>MercadoPago + efectivo/contraentrega</i>"]
+  Payments["Payments<br/><i>MercadoPago del local + efectivo</i>"]
   Notifications["Notifications<br/><i>push, WhatsApp, email</i>"]
-  AdminPanel["Admin Panel (ATS)<br/><i>negocios, suscripciones, riders ATS, zonas</i>"]
-  BusinessPanel["Business Panel<br/><i>recepción de pedidos, menú, reportes</i>"]
+  AdminPanel["Admin Panel (ATS)<br/><i>alta de locales, suscripciones, soporte</i>"]
+  BusinessPanel["Business Panel<br/><i>pedidos, menú, riders, reportes</i>"]
   Reports["Reports / Analytics<br/><i>(etapa posterior)</i>"]
 
   Auth --> Business
@@ -98,9 +104,9 @@ graph TD
   Dispatch --> Notifications
   Tracking --> Riders
   AdminPanel --> Business
-  AdminPanel --> Riders
   BusinessPanel --> Orders
   BusinessPanel --> Catalog
+  BusinessPanel --> Riders
   Reports --> Orders
 
   classDef nucleo fill:#1f6feb,color:#fff,stroke:#1f6feb;
@@ -112,16 +118,16 @@ graph TD
 | Módulo | Responsabilidad | MVP |
 |---|---|---|
 | **Auth** | Login/registro multi-rol (un rol por usuario) | Supabase Auth + tabla `Profile` |
-| **Business** | Alta de negocios, `operationMode`, zona, suscripción, horarios | ✅ núcleo |
+| **Business** | Alta de locales, zona, suscripción, horarios, conexión cuenta MercadoPago | ✅ núcleo |
 | **Catalog** | Menú: productos, categorías, variantes, modificadores, stock | ✅ |
 | **Orders (OMS)** | Ciclo de vida del pedido, estados, SAGA de checkout | ✅ núcleo |
-| **Dispatch** | Asignación de rider según `operationMode` | Manual en MVP |
-| **Riders** | Riders propios o de ATS | ✅ |
+| **Dispatch** | Asignación de un rider **del local** al pedido | Manual en MVP |
+| **Riders** | Repartidores del local | ✅ |
 | **Tracking** | Ubicación en vivo, ETA | Supabase Realtime |
-| **Payments** | MercadoPago + efectivo/contraentrega | ✅ |
+| **Payments** | Cobro al cliente en la **cuenta MercadoPago del local** + efectivo | ✅ |
 | **Notifications** | Push, WhatsApp, email | Etapa 4 |
-| **Admin Panel (ATS)** | Negocios afiliados, suscripciones, riders ATS, zonas | Etapa 3 |
-| **Business Panel** | Recepción de pedidos, menú, reportes | ✅ |
+| **Admin Panel (ATS)** | Onboarding de locales, suscripciones/planes, soporte | Etapa 3 |
+| **Business Panel** | Pedidos, menú, gestión de riders, reportes | ✅ |
 | **Reports** | Métricas de pedidos, ventas, performance | Etapa posterior |
 
 ---
@@ -146,26 +152,19 @@ stateDiagram-v2
   CANCELLED --> [*]
 ```
 
-### Ramificación del Dispatch según `operationMode`
+### Dispatch (asignación de rider del local)
 
 ```mermaid
 flowchart TD
-  A["Pedido listo para asignar<br/>(READY_FOR_PICKUP)"] --> B{"operationMode<br/>del negocio"}
-  B -->|OWN_FLEET| C["Lista riders con<br/>businessId = pedido.businessId"]
-  B -->|MARKETPLACE_FLEET| D["Lista riders del pool ATS<br/>(businessId IS NULL)<br/>filtrados por zona/disponibilidad"]
-  B -->|HYBRID| E["1° intenta OWN_FLEET"]
-  E -->|sin rider| D
-  C --> F["Asignación MANUAL (MVP)<br/>negocio o admin ATS elige"]
-  D --> F
+  A["Pedido listo para asignar<br/>(READY_FOR_PICKUP)"] --> C["Lista riders disponibles<br/>del local (businessId = pedido.businessId,<br/>status = AVAILABLE)"]
+  C --> F["El local asigna MANUALMENTE (MVP)"]
   F --> G["Delivery.status = ASSIGNED"]
-
-  classDef futuro fill:#30363d,color:#8b949e,stroke:#30363d;
-  class E futuro;
+  G --> H["Rider acepta y comparte ubicación<br/>(tracking en vivo)"]
 ```
 
-> En el MVP la asignación es **manual** (negocio para OWN_FLEET, admin ATS para
-> MARKETPLACE_FLEET). `HYBRID` está previsto en el modelo de datos pero **no
-> operativo**. La automatización por proximidad queda para etapa posterior.
+> En el MVP el **local** asigna entre sus propios riders de forma **manual**. La
+> automatización por proximidad/carga queda para una etapa posterior. ATS no
+> participa en la operación del despacho: solo provee la herramienta.
 
 ---
 
@@ -214,8 +213,9 @@ sequenceDiagram
 | Asignar rider (post-checkout) | sin rider disponible | notificar al negocio, reintentar o cancelar |
 
 > En el MVP (Etapa 1) el pago es **solo efectivo/contraentrega**, por lo que el
-> paso 2 solo registra el método. MercadoPago se integra en Etapa 2 y ahí la SAGA
-> ejerce la compensación de pago real.
+> paso 2 solo registra el método. MercadoPago se integra en Etapa 2: el cobro se
+> hace **en la cuenta del propio local** (MercadoPago Connect), ATS no toca los
+> fondos del pedido, y ahí la SAGA ejerce la compensación de pago real.
 
 ---
 
@@ -248,7 +248,7 @@ solo ve lo que le corresponde, **mientras el delivery está activo**.
 | DB / Auth / Storage / Realtime | Supabase (Postgres + RLS) | Supabase |
 | Web cliente + paneles | React + Vite + Tailwind (`apps/web`, `apps/admin`) | **Vercel** |
 | Mobile cliente + rider | React Native + Expo → EAS Build (`apps/mobile`) | EAS / stores |
-| Pagos | MercadoPago Checkout API | — |
+| Pagos | MercadoPago Connect (cuenta de cada local) + efectivo | — |
 | Mapas | Mapbox | — |
 | Keep-alive | `GET /health` (sin tocar DB) golpeado por cron-job.org c/10 min | — |
 
@@ -278,7 +278,7 @@ ATS-Express/
 |---|---|---|
 | **0** | Schema Prisma + RLS + arquitectura | ✅ **completada** |
 | 1 | MVP núcleo: Catalog + Orders + Business Panel + cliente básico, solo efectivo | ⏭️ siguiente |
-| 2 | MercadoPago + Dispatch manual + Riders + estados completos + tracking | |
-| 3 | Marketplace: Admin ATS + suscripciones + pool de riders | |
+| 2 | MercadoPago Connect (cobro al local) + Dispatch manual + Riders + estados + tracking | |
+| 3 | Plataforma SaaS: Admin ATS (onboarding de locales) + suscripciones/planes | |
 | 4 | Notificaciones (push/WhatsApp) + reportes + `/health` keep-alive | |
-| 5 | Hardening: RLS, rate limiting, observabilidad, Dispatch automático, HYBRID real | |
+| 5 | Hardening: RLS, rate limiting, observabilidad, Dispatch automático | |

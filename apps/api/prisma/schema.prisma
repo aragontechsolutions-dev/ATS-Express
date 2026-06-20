@@ -1,10 +1,14 @@
 // =============================================================================
-// ATS-Express — Sistema de Delivery Híbrido
+// ATS-Express — Plataforma SaaS de pedidos y delivery
 // Schema Prisma (Etapa 0 — Modelo de datos)
+//
+// Modelo de negocio: SaaS white-label para locales que ya tienen sus propios
+//   repartidores. ATS provee el software; no opera flota ni maneja los fondos
+//   del pedido (el cobro va directo a la cuenta MercadoPago del local).
 //
 // Stack: NestJS (monolito modular) + Prisma v5 + Supabase (Postgres + RLS)
 // Multi-tenancy "bridge model": una sola base, diferenciación por datos
-//   (operationMode + businessId). Aislamiento primario en NestJS,
+//   (businessId). Aislamiento primario en NestJS,
 //   RLS como defensa en profundidad (policies se agregan luego en Etapa 0).
 //
 // Convenciones:
@@ -32,20 +36,12 @@ datasource db {
 // ENUMS
 // =============================================================================
 
-/// Modo de despacho del negocio. Definido desde el MVP (cambiarlo luego
-/// implica migración compleja). HYBRID queda previsto pero no operativo en MVP.
-enum OperationMode {
-  OWN_FLEET // riders propios; dispatch busca solo entre ellos
-  MARKETPLACE_FLEET // sin flota propia; usa el pool de riders de ATS
-  HYBRID // riders propios + fallback al pool de ATS (no operativo en MVP)
-}
-
 /// Un único rol por usuario (decisión MVP).
 enum UserRole {
   CUSTOMER // cliente final
   BUSINESS_OWNER // dueño de negocio
   BUSINESS_STAFF // staff del negocio (recepción de pedidos, menú)
-  RIDER // repartidor (propio del negocio o del pool ATS)
+  RIDER // repartidor del local
   ATS_ADMIN // admin de la empresa de delivery (ATS)
   SUPER_ADMIN // super-admin de plataforma
 }
@@ -111,10 +107,16 @@ enum SubscriptionStatus {
   CANCELLED // dada de baja
 }
 
-/// Cómo se gestiona el cobro de la suscripción.
+/// Cómo se gestiona el cobro de la suscripción (ATS → local).
 enum SubscriptionProvider {
   MANUAL // factura/transferencia gestionada a mano (MVP)
   MERCADOPAGO // suscripción recurrente vía MercadoPago (futuro)
+}
+
+/// Plan/tier de la suscripción SaaS del local.
+enum SubscriptionPlan {
+  BASIC // funcionalidades núcleo
+  PRO // límites mayores / features avanzadas
 }
 
 // =============================================================================
@@ -131,7 +133,6 @@ model Zone {
   updatedAt DateTime @updatedAt
 
   businesses Business[]
-  riders     Rider[]
   orders     Order[]
 
   @@map("zones")
@@ -171,14 +172,14 @@ model Profile {
 }
 
 /// Negocio afiliado (tenant). Núcleo del multi-tenant.
+/// Modelo SaaS: el local trae sus propios riders; ATS solo provee el software.
 model Business {
-  id            String        @id @default(uuid()) @db.Uuid
-  name          String
-  slug          String        @unique // para URL pública de pedido
-  description   String?
-  logoUrl       String?
-  operationMode OperationMode @default(OWN_FLEET)
-  isActive      Boolean       @default(true)
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String
+  slug        String  @unique // para URL pública de pedido (white-label)
+  description String?
+  logoUrl     String?
+  isActive    Boolean @default(true)
 
   // Datos de contacto / ubicación del local
   phone     String?
@@ -201,20 +202,28 @@ model Business {
   minOrderTotal Decimal  @default(0) @db.Decimal(10, 2)
   prepTimeMins  Int      @default(20)
 
+  // Cobro DIRECTO al local: cada negocio conecta su propia cuenta MercadoPago
+  // (MercadoPago Connect / OAuth). ATS nunca es intermediario de los fondos del
+  // pedido; solo cobra la suscripción. Campos sensibles → cifrar en reposo.
+  mpUserId      String? // collector/user id de MercadoPago del local
+  mpAccessToken String? // token de la cuenta del local (OAuth)
+  mpRefreshToken String?
+  mpPublicKey   String? // public key para el checkout en el front
+  mpConnectedAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   // Relaciones tenant-owned
-  hours         BusinessHour[]
-  categories    Category[]
-  products      Product[]
+  hours          BusinessHour[]
+  categories     Category[]
+  products       Product[]
   modifierGroups ModifierGroup[]
-  orders        Order[]
-  riders        Rider[] // riders propios (businessId no nulo)
-  subscription  Subscription?
+  orders         Order[]
+  riders         Rider[] // riders del local
+  subscription   Subscription?
 
   @@index([zoneId])
-  @@index([operationMode])
   @@map("businesses")
 }
 
@@ -242,6 +251,7 @@ model Subscription {
   business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
 
   status      SubscriptionStatus   @default(TRIAL)
+  plan        SubscriptionPlan     @default(BASIC)
   provider    SubscriptionProvider @default(MANUAL)
   amount      Decimal              @db.Decimal(10, 2)
   currency    String               @default("UYU")
@@ -535,18 +545,15 @@ model Payment {
 // RIDERS, DISPATCH (Delivery) y TRACKING
 // =============================================================================
 
-/// Repartidor. businessId nulo => pertenece al pool de ATS (marketplace).
-/// businessId no nulo => rider propio del negocio.
+/// Repartidor del local. En el modelo SaaS, ATS no tiene flota propia:
+/// todo rider pertenece a un negocio (businessId obligatorio).
 model Rider {
   id        String  @id @default(uuid()) @db.Uuid
   profileId String  @unique @db.Uuid
   profile   Profile @relation("RiderProfile", fields: [profileId], references: [id], onDelete: Cascade)
 
-  businessId String?   @db.Uuid // null = pool ATS
-  business   Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
-
-  zoneId String? @db.Uuid
-  zone   Zone?   @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+  businessId String   @db.Uuid
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
 
   status      RiderStatus @default(OFFLINE)
   vehicleType String? // ej. "moto", "bici", "auto"
@@ -559,7 +566,6 @@ model Rider {
   deliveries Delivery[]
 
   @@index([businessId])
-  @@index([zoneId])
   @@index([status])
   @@map("riders")
 }
@@ -578,8 +584,8 @@ model RiderLocation {
   @@map("rider_locations")
 }
 
-/// Asignación de despacho de un pedido a un rider (1:1 con Order).
-/// Manual en el MVP; la lógica de elegibilidad depende de operationMode.
+/// Asignación de despacho de un pedido a un rider del local (1:1 con Order).
+/// El local asigna entre sus propios riders (manual en el MVP).
 model Delivery {
   id      String @id @default(uuid()) @db.Uuid
   orderId String @unique @db.Uuid

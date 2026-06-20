@@ -6,13 +6,6 @@
  * Mantener sincronizado con apps/api/prisma/schema.prisma.
  */
 
-export const OperationMode = {
-  OWN_FLEET: 'OWN_FLEET',
-  MARKETPLACE_FLEET: 'MARKETPLACE_FLEET',
-  HYBRID: 'HYBRID',
-} as const;
-export type OperationMode = (typeof OperationMode)[keyof typeof OperationMode];
-
 export const UserRole = {
   CUSTOMER: 'CUSTOMER',
   BUSINESS_OWNER: 'BUSINESS_OWNER',
@@ -94,6 +87,13 @@ export const SubscriptionProvider = {
 } as const;
 export type SubscriptionProvider =
   (typeof SubscriptionProvider)[keyof typeof SubscriptionProvider];
+
+export const SubscriptionPlan = {
+  BASIC: 'BASIC',
+  PRO: 'PRO',
+} as const;
+export type SubscriptionPlan =
+  (typeof SubscriptionPlan)[keyof typeof SubscriptionPlan];
 
 /** Localidades de cobertura inicial (Maldonado, UY). */
 export const COVERAGE_ZONES = [
