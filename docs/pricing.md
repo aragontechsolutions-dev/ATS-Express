@@ -56,6 +56,39 @@ arriba con **cobro online + automatización WhatsApp + multi-sucursal** (Premium
 - Riders adicionales por encima del límite del plan.
 - Dominio propio para la carta online.
 
+## Promo de lanzamiento — Primeros 10 clientes
+
+> Es una **promoción**, NO un plan nuevo. Objetivo: conseguir los primeros 10
+> locales lo más rápido posible y generar casos de éxito.
+
+**Oferta:** **1 mes de Premium gratis**. Prueban el producto al full (incluido
+tracking en vivo y cobro online), y recién después eligen plan.
+
+**Reglas acordadas:**
+
+1. **Al terminar el mes → baja automática a FREE** si no eligen plan ni cargan
+   pago. No se suspende el servicio: conservan local y datos, y quedan como
+   lead caliente para reconquistar a Pro/Premium.
+2. **Cobro online sigue exclusivo de Premium.** Para evitar el "downgrade
+   shock", a estos 10 se les ofrece una **rebaja de fidelidad: Premium con
+   descuento por 3 meses adicionales** (precio promo a definir, ej. ~$4.900 en
+   vez de ~$5.900). Solo para este grupo inicial.
+3. **Contrapartida:** un **testimonio / caso de éxito** utilizable para vender a
+   los siguientes locales.
+
+**Expectativa realista:** no asumir que >50% se queda en Premium. Muchos bajarán
+a **Pro** (que para ellos ya es enorme vs. WhatsApp) — eso **igual es un cliente
+que paga**. El éxito se mide en "siguen pagando algo", idealmente Premium.
+
+**Modelado en el sistema (sin features nuevas):**
+
+- `Subscription`: `plan = PREMIUM`, `status = TRIAL`, con fecha de fin de trial.
+- Al vencer: si no hay conversión, transición a `plan = FREE`, `status = ACTIVE`.
+- La rebaja de fidelidad se modela como precio promocional en la suscripción
+  (monto + vigencia 3 meses), no como otro plan.
+- Marcar estos locales como "cohorte de lanzamiento" (flag/tag) para poder
+  segmentarlos en reportes y aplicarles el precio promo.
+
 ## Notas de implementación
 
 - Enum `SubscriptionPlan` = `FREE | PRO | PREMIUM` (ver `schema.prisma`).
